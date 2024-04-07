@@ -161,25 +161,11 @@ class ParallelEigenFunction(nn.Module):
 
     # TODO: for variable sized inputs there must be a better way...
     def forward(self, x):
-        shape = {chr(ord('a') + i) : x.shape[i] for i in range(len(x.shape) - 1)}
-
-        x = rearrange(x, '... c -> (...) c')
-        eigen_f = self.net(x)
-
-        shps = ''.join([f'{k} ' for k in shape.keys()])[:-1]
-        eigen_f = rearrange(eigen_f, f'({shps}) e c -> {shps} e c', **shape)
-
-        s = eigen_f.shape
-        const = torch.ones((s[0], s[1], 1, s[3])).cuda()
-        eigen_f = torch.cat([const, eigen_f], dim=-2)
-
-        return eigen_f
+        return self.net(x)
 
 # make domain for eigen-functions
-def make_domain(num_basis, batch_size):
-    window = torch.linspace(0, 1, num_basis)
-    domain = repeat(window, 't -> b t', b=batch_size)[..., None]
-    return domain
+def make_domain(window_size):
+    return torch.linspace(0, 1, window_size)[..., None]
 
 # normalize eigen-functions
 def normalize(eigenfunc):
@@ -188,38 +174,19 @@ def normalize(eigenfunc):
 
 # compute inner product of eigen-functions to encourage orthonormality
 def orthonormality(eigenfunc):
-    prod = torch.einsum('b t i c, b t j c -> b i j c', eigenfunc, eigenfunc) 
+    prod = torch.einsum('t i c, t j c -> i j c', eigenfunc, eigenfunc) 
+    prod = rearrange(prod, 'i j c -> c i j')
 
-    # mask to make triu
-    ones = torch.ones_like(prod[..., -1]).cuda()
-    ones = torch.triu(ones, diagonal=1)
-    ones = repeat(ones, 'b i j -> b i j c', c=eigenfunc.shape[-1])
-
-    prod = (prod * ones) / eigenfunc.shape[1]
-    ortho = prod.square().sum() / (prod.shape[1] * prod.shape[2])
+    prod = torch.triu(prod, diagonal=1) / eigenfunc.shape[0]
+    ortho = prod.square().sum() / (prod.shape[-1] * prod.shape[-2])
 
     return ortho
 
-# main neural basis compression and reconstruction
-def neural_recon(x, model, window_size, batch_size):
-    # make input domain, get eigen-functions
-    domain = make_domain(window_size, batch_size).cuda()
-
-    eigenfunc = model(domain)
-
-    # normalize to have inner product of 1
-    eigenfunc = normalize(eigenfunc)
-    if x is None: return eigenfunc
-
-    # compute orthonormality (for loss)
-    ortho = orthonormality(eigenfunc)
-
-    # get coeffs and reconstructed function
-    # ie. this is a compression mechanism
-    coeffs = torch.einsum('b t c, b t e c -> b e c', x, eigenfunc)
-    recon = torch.einsum('b e c, b t e c -> b t c', coeffs, eigenfunc)
-
-    return recon, coeffs, eigenfunc, ortho
+# add ones to eigen-functions
+def add_ones(eigenfunc):
+    sh = eigenfunc.shape
+    ones = torch.ones(sh[0], 1, sh[2]).cuda()
+    return torch.cat([ones, eigenfunc], dim=1)
 
 class Model(nn.Module):
     def __init__(self, configs):
@@ -234,16 +201,9 @@ class Model(nn.Module):
         self.num_basis_in = configs.num_basis_in
         self.num_basis_out = configs.num_basis_out
 
-        # map label info from 4 -> label_dim
-        self.label_dim = (self.num_basis_in + 1) * self.channels
-        label_hidden = 256
-        self.label_map = nn.Sequential(
-            nn.Linear(4, label_hidden),
-            nn.ReLU(),
-            nn.Linear(label_hidden, label_hidden),
-            nn.ReLU(),
-            nn.Linear(label_hidden, self.label_dim),
-        ).cuda()
+        self.is_train = True
+        self.eigenfunc_in = None
+        self.eigenfunc_out = None
 
         linear_in = (self.num_basis_in + 1) * self.channels + 4
         linear_out = (self.num_basis_out + 1) * self.channels
@@ -254,27 +214,33 @@ class Model(nn.Module):
         partial_model = partial(
             ParallelEigenFunction,
             dim_in = 1,
-            dim_out = self.channels,
+            dim_out = 1,
             dim_hidden = self.dim_hidden,
             num_layers = self.layers,
         )
 
         # make input model
-        w0_in = torch.ones(self.num_basis_in).cuda()
+        w0_in = torch.ones(self.num_basis_in * self.channels).cuda()
         w0_initial_in = torch.linspace(1, self.num_basis_in, self.num_basis_in).cuda()
+        
+        w0_initial_in = repeat(w0_initial_in, 'e -> e c', c=self.channels)
+        w0_initial_in = rearrange(w0_initial_in, 'e c -> (e c)')
 
         self.eigenmodel_in = partial_model(
-            ensembles = self.num_basis_in,
+            ensembles = self.num_basis_in * self.channels,
             w0 = w0_in,
             w0_initial = w0_initial_in,
         ).cuda()
 
         # make output model
-        w0_out = torch.ones(self.num_basis_out).cuda()
+        w0_out = torch.ones(self.num_basis_out * self.channels).cuda()
         w0_initial_out = torch.linspace(1, self.num_basis_out, self.num_basis_out).cuda()
 
+        w0_initial_out = repeat(w0_initial_out, 'e -> e c', c=self.channels)
+        w0_initial_out = rearrange(w0_initial_out, 'e c -> (e c)')
+
         self.eigenmodel_out = partial_model(
-            ensembles = self.num_basis_out,
+            ensembles = self.num_basis_out * self.channels,
             w0 = w0_out,
             w0_initial = w0_initial_out,
         ).cuda()
@@ -282,25 +248,72 @@ class Model(nn.Module):
         # print parameters
         print(f'num params: {sum(p.numel() for p in self.parameters())}')
 
+    # main neural basis compression and reconstruction
+    def neural_recon(self, x, model, window_size):
+        # make input domain, get eigen-functions
+        domain = make_domain(window_size).cuda()
+        eigenfunc = model(domain)
+        eigenfunc = rearrange(eigenfunc, 't (e c) 1 -> t e c', e=self.num_basis_in, c=self.channels)
+        eigenfunc = add_ones(eigenfunc)
+
+        # normalize to have inner product of 1
+        eigenfunc = normalize(eigenfunc)
+        if x is None: return eigenfunc
+
+        # compute orthonormality (for loss)
+        ortho = orthonormality(eigenfunc)
+
+        # get coeffs and reconstructed function
+        # ie. this is a compression mechanism
+        coeffs = torch.einsum('b t c, t e c -> b e c', x, eigenfunc)
+        recon = torch.einsum('b e c, t e c -> b t c', coeffs, eigenfunc)
+
+        return recon, coeffs, eigenfunc, ortho
+    
+    def set_eigenfuncs(self):
+        domain_in = make_domain(self.seq_len).cuda()
+        domain_out = make_domain(self.pred_len).cuda()
+
+        eigenfunc_in = self.eigenmodel_in(domain_in)
+        eigenfunc_in = rearrange(eigenfunc_in, 't (e c) 1 -> t e c', e=self.num_basis_in, c=self.channels)
+        eigenfunc_in = add_ones(eigenfunc_in)
+        self.eigenfunc_in = normalize(eigenfunc_in)
+
+        eigenfunc_out = self.eigenmodel_out(domain_out)
+        eigenfunc_out = rearrange(eigenfunc_out, 't (e c) 1 -> t e c', e=self.num_basis_out, c=self.channels)
+        eigenfunc_out = add_ones(eigenfunc_out)
+        self.eigenfunc_out = normalize(eigenfunc_out)
+
+        self.is_train = False
+        return
+
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, batch_y=None):
         x = x_enc 
         y = batch_y
         label = x_mark_enc[:, -1]
 
-        # get coeffs, perform reconstruction
-        recon_in, coeffs_in, eigenfunc_in, ortho_in = neural_recon(
-            x, self.eigenmodel_in, self.seq_len, x.shape[0]
-        )
-
         if y is not None:
-            recon_out, coeffs_out, eigenfunc_out, ortho_out = neural_recon(
-                y, self.eigenmodel_out, self.pred_len, x.shape[0]
+            # get coeffs, perform reconstruction
+            recon_in, coeffs_in, eigenfunc_in, ortho_in = self.neural_recon(
+                x, self.eigenmodel_in, self.seq_len
             )
+
+            recon_out, coeffs_out, eigenfunc_out, ortho_out = self.neural_recon(
+                y, self.eigenmodel_out, self.pred_len
+            )
+
             ortho_loss = ortho_in + ortho_out
+
+            # set eigenfuncs for test time
+            self.is_train = True
+            self.eigenfunc_in = eigenfunc_in[0]
+            self.eigenfunc_out = eigenfunc_out[0]
         else:
-            eigenfunc_out = neural_recon(
-                None, self.eigenmodel_out, self.pred_len, x.shape[0]
-            )
+            if self.is_train: self.set_eigenfuncs()
+            eigenfunc_in = self.eigenfunc_in
+            eigenfunc_out = self.eigenfunc_out
+
+            coeffs_in = torch.einsum('b t c, t e c -> b e c', x, eigenfunc_in)
 
         # predict future coeffs
         coeff_flat = rearrange(coeffs_in, 'b e c -> b (e c)')
@@ -309,7 +322,7 @@ class Model(nn.Module):
         pred_coeff = rearrange(coeff_flat_pred, 'b (e c) -> b e c', e=self.num_basis_out+1, c=self.channels)
 
         # reconstruct output function
-        pred_recon = torch.einsum('b e c, b t e c -> b t c', pred_coeff, eigenfunc_out)
+        pred_recon = torch.einsum('b e c, t e c -> b t c', pred_coeff, eigenfunc_out)
 
         # losses
         if y is None:

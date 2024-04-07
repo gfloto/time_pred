@@ -4,7 +4,7 @@ export CUDA_VISIBLE_DEVICES=0
 model_name=NeuralBasis
 
 learning_rate=0.0001
-batch_size=128
+batch_size=64
 e_layers=4
 d_model=64
 
