@@ -50,8 +50,8 @@ if __name__ == '__main__':
     parser.add_argument('--anomaly_ratio', type=float, default=0.25, help='prior anomaly ratio (%)')
 
     # model define
-    parser.add_argument('--num_basis_in', type=int, default=41, help='number of basis functions')
-    parser.add_argument('--num_basis_out', type=int, default=41, help='number of basis functions')
+    parser.add_argument('--num_basis_in', type=int, default=71, help='number of basis functions')
+    parser.add_argument('--num_basis_out', type=int, default=71, help='number of basis functions')
 
     parser.add_argument('--expand', type=int, default=2, help='expansion factor for Mamba')
     parser.add_argument('--d_conv', type=int, default=4, help='conv kernel size for Mamba')

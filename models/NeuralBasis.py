@@ -160,8 +160,14 @@ class ParallelEigenFunction(nn.Module):
         )
 
     # TODO: for variable sized inputs there must be a better way...
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x, num_basis, channels):
+        x = self.net(x)
+
+        x = rearrange(x, 't (e c) 1 -> t e c', e=num_basis, c=channels)
+        x = add_ones(x)
+        x = normalize(x)
+
+        return x
 
 # make domain for eigen-functions
 def make_domain(window_size):
@@ -181,6 +187,23 @@ def orthonormality(eigenfunc):
     ortho = prod.square().sum() / (prod.shape[-1] * prod.shape[-2])
 
     return ortho
+
+# main neural basis compression and reconstruction
+def neural_recon(x, model, window_size, num_basis, channels):
+    # make input domain, get eigen-functions
+    domain = make_domain(window_size).cuda()
+    eigenfunc = model(domain, num_basis, channels)
+    if x is None: return eigenfunc
+
+    # compute orthonormality (for loss)
+    ortho = orthonormality(eigenfunc)
+
+    # get coeffs and reconstructed function
+    # ie. this is a compression mechanism
+    coeffs = torch.einsum('b t c, t e c -> b e c', x, eigenfunc)
+    recon = torch.einsum('b e c, t e c -> b t c', coeffs, eigenfunc)
+
+    return recon, coeffs, eigenfunc, ortho
 
 # add ones to eigen-functions
 def add_ones(eigenfunc):
@@ -205,11 +228,13 @@ class Model(nn.Module):
         self.eigenfunc_in = None
         self.eigenfunc_out = None
 
-        linear_in = (self.num_basis_in + 1) * self.channels + 4
-        linear_out = (self.num_basis_out + 1) * self.channels
-        print(f'linear_in: {linear_in}, linear_out: {linear_out}')
-        self.linear = nn.Linear(linear_in, linear_out).cuda()
+        # make time operator
+        dim_in = (self.num_basis_in + 1) * self.channels + 4
+        dim_out = (self.num_basis_out + 1) * self.channels
 
+        self.time_op = nn.Linear(dim_in, dim_out).cuda()
+
+        # make eigen-models
         self.eigen_models = {}
         partial_model = partial(
             ParallelEigenFunction,
@@ -247,42 +272,17 @@ class Model(nn.Module):
         
         # print parameters
         print(f'num params: {sum(p.numel() for p in self.parameters())}')
-
-    # main neural basis compression and reconstruction
-    def neural_recon(self, x, model, window_size):
-        # make input domain, get eigen-functions
-        domain = make_domain(window_size).cuda()
-        eigenfunc = model(domain)
-        eigenfunc = rearrange(eigenfunc, 't (e c) 1 -> t e c', e=self.num_basis_in, c=self.channels)
-        eigenfunc = add_ones(eigenfunc)
-
-        # normalize to have inner product of 1
-        eigenfunc = normalize(eigenfunc)
-        if x is None: return eigenfunc
-
-        # compute orthonormality (for loss)
-        ortho = orthonormality(eigenfunc)
-
-        # get coeffs and reconstructed function
-        # ie. this is a compression mechanism
-        coeffs = torch.einsum('b t c, t e c -> b e c', x, eigenfunc)
-        recon = torch.einsum('b e c, t e c -> b t c', coeffs, eigenfunc)
-
-        return recon, coeffs, eigenfunc, ortho
     
     def set_eigenfuncs(self):
         domain_in = make_domain(self.seq_len).cuda()
         domain_out = make_domain(self.pred_len).cuda()
 
-        eigenfunc_in = self.eigenmodel_in(domain_in)
-        eigenfunc_in = rearrange(eigenfunc_in, 't (e c) 1 -> t e c', e=self.num_basis_in, c=self.channels)
-        eigenfunc_in = add_ones(eigenfunc_in)
-        self.eigenfunc_in = normalize(eigenfunc_in)
-
-        eigenfunc_out = self.eigenmodel_out(domain_out)
-        eigenfunc_out = rearrange(eigenfunc_out, 't (e c) 1 -> t e c', e=self.num_basis_out, c=self.channels)
-        eigenfunc_out = add_ones(eigenfunc_out)
-        self.eigenfunc_out = normalize(eigenfunc_out)
+        self.eigenfunc_in = self.eigenmodel_in(
+            domain_in, self.num_basis_in, self.channels
+        )
+        self.eigenfunc_out = self.eigenmodel_out(
+            domain_out, self.num_basis_out, self.channels
+        )
 
         self.is_train = False
         return
@@ -294,12 +294,15 @@ class Model(nn.Module):
 
         if y is not None:
             # get coeffs, perform reconstruction
-            recon_in, coeffs_in, eigenfunc_in, ortho_in = self.neural_recon(
-                x, self.eigenmodel_in, self.seq_len
+            recon_in, coeffs_in, eigenfunc_in, ortho_in = neural_recon(
+                x, self.eigenmodel_in, self.seq_len, self.num_basis_in, self.channels
             )
 
-            recon_out, coeffs_out, eigenfunc_out, ortho_out = self.neural_recon(
-                y, self.eigenmodel_out, self.pred_len
+            # predict res
+            y -= x 
+
+            recon_out, coeffs_out, eigenfunc_out, ortho_out = neural_recon(
+                y, self.eigenmodel_out, self.pred_len, self.num_basis_out, self.channels
             )
 
             ortho_loss = ortho_in + ortho_out
@@ -314,24 +317,30 @@ class Model(nn.Module):
             eigenfunc_out = self.eigenfunc_out
 
             coeffs_in = torch.einsum('b t c, t e c -> b e c', x, eigenfunc_in)
+            recon_in = torch.einsum('b e c, t e c -> b t c', coeffs_in, eigenfunc_in)
 
-        # predict future coeffs
+        # time operator 
         coeff_flat = rearrange(coeffs_in, 'b e c -> b (e c)')
         coeff_flat_in = torch.cat([coeff_flat, label], dim=-1)
-        coeff_flat_pred = self.linear(coeff_flat_in)
-        pred_coeff = rearrange(coeff_flat_pred, 'b (e c) -> b e c', e=self.num_basis_out+1, c=self.channels)
 
-        # reconstruct output function
+        coeff_pred_flat = self.time_op(coeff_flat_in)
+
+        pred_coeff = rearrange(coeff_pred_flat, 'b (e c) -> b e c', e=self.num_basis_out+1, c=self.channels)
         pred_recon = torch.einsum('b e c, t e c -> b t c', pred_coeff, eigenfunc_out)
+        pred = pred_recon
 
         # losses
         if y is None:
-            return pred_recon
+            return pred + x 
         else:
-            recon_in_loss = (x - recon_in).square().mean()
-            recon_out_loss = (y - recon_out).square().mean()
-            pred_coeff_loss = (coeffs_out - pred_coeff).square().mean()
-            pred_recon_loss = (y - pred_recon).square().mean()
-            loss = recon_in_loss + recon_out_loss + pred_coeff_loss + pred_recon_loss + ortho_loss
+            recon_in_loss = (x - recon_in).abs().mean()
+            recon_out_loss = (y - recon_out).abs().mean()
+            pred_coeff_loss = (coeffs_out - pred_coeff).abs().mean()
+            pred_recon_loss = (y - pred).abs().mean()
+            loss =  recon_in_loss +\
+                    recon_out_loss +\
+                    pred_coeff_loss +\
+                    pred_recon_loss +\
+                    ortho_loss
 
-            return pred_recon, loss
+            return pred + x, loss
