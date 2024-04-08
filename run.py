@@ -37,8 +37,8 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='location of model checkpoints')
 
     # forecasting task
-    parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
-    parser.add_argument('--label_len', type=int, default=48, help='start token length')
+    parser.add_argument('--seq_len', type=int, default=41, help='input sequence length')
+    parser.add_argument('--label_len', type=int, default=41, help='start token length')
     parser.add_argument('--pred_len', type=int, default=96, help='prediction sequence length')
     parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
     parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
@@ -50,8 +50,8 @@ if __name__ == '__main__':
     parser.add_argument('--anomaly_ratio', type=float, default=0.25, help='prior anomaly ratio (%)')
 
     # model define
-    parser.add_argument('--num_basis_in', type=int, default=71, help='number of basis functions')
-    parser.add_argument('--num_basis_out', type=int, default=71, help='number of basis functions')
+    parser.add_argument('--num_basis_in', type=int, default=63, help='number of basis functions')
+    parser.add_argument('--num_basis_out', type=int, default=63, help='number of basis functions')
 
     parser.add_argument('--expand', type=int, default=2, help='expansion factor for Mamba')
     parser.add_argument('--d_conv', type=int, default=4, help='conv kernel size for Mamba')

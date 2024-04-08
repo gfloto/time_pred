@@ -168,8 +168,9 @@ class ParallelEigenFunction(nn.Module):
         x = normalize(x)
 
         return x
-
-# from https://openreview.net/forum?id=cGDAkQo1C0p
+'''
+from https://openreview.net/forum?id=cGDAkQo1C0p
+'''
 class RevIN(nn.Module):
     def __init__(self, num_features: int, eps=1e-5, affine=True):
         """
@@ -281,8 +282,14 @@ class Model(nn.Module):
         # revin for normalization
         self.revin = RevIN(self.channels, affine=True)
 
+        # label embeddings
+        emb_dim = 16
+        self.hour_emb = nn.Embedding(24, emb_dim).cuda()
+        self.day_emb = nn.Embedding(31, emb_dim).cuda()
+        self.week_emb = nn.Embedding(7, emb_dim).cuda()
+
         # make time operator
-        dim_in = (self.num_basis_in + 1) * self.channels + 4
+        dim_in = (self.num_basis_in + 1) * self.channels + 4#3 * emb_dim 
         dim_out = (self.num_basis_out + 1) * self.channels
 
         self.time_op = nn.Linear(dim_in, dim_out).cuda()
@@ -340,11 +347,27 @@ class Model(nn.Module):
         self.is_train = False
         return
 
+    # unpack weird dataloader formatting
+    def label2emb(self, label):
+        norm = lambda x: (x - x.min()) / (x.max() - x.min())
+
+        hour = (23 * norm(label[:, 0])).long()
+        day = (30 * norm(label[:, 2])).long()
+        week = (6 * norm(label[:, 1])).long()
+
+        hour_emb = self.hour_emb(hour)
+        day_emb = self.day_emb(day)
+        week_emb = self.week_emb(week)
+
+        return torch.cat([hour_emb, day_emb, week_emb], dim=-1)
+
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, batch_y=None):
+        # following format of other models in repo...
         x = x_enc 
         y = batch_y
         label = x_mark_enc[:, -1]
 
+        # norm first, (denorm after)
         x_in = self.revin(x, 'norm')
 
         if y is not None:
@@ -374,6 +397,8 @@ class Model(nn.Module):
             recon_in = torch.einsum('b e c, t e c -> b t c', coeffs_in, eigenfunc_in)
 
         # time operator 
+        #label_emb = self.label2emb(label)
+
         coeff_flat = rearrange(coeffs_in, 'b e c -> b (e c)')
         coeff_flat_in = torch.cat([coeff_flat, label], dim=-1)
 
@@ -387,10 +412,11 @@ class Model(nn.Module):
             pred = self.revin(pred, 'denorm')
             return pred
         else:
-            recon_in_loss = (x_in - recon_in).abs().mean()
-            recon_out_loss = (y_in - recon_out).abs().mean()
-            pred_coeff_loss = (coeffs_out - pred_coeff).abs().mean()
-            pred_recon_loss = (y_in - pred).abs().mean()
+            recon_in_loss = (x_in - recon_in).square().mean()
+            recon_out_loss = (y_in - recon_out).square().mean()
+            pred_coeff_loss = (coeffs_out - pred_coeff).square().mean()
+            pred_recon_loss = (y_in - pred).square().mean()
+
             loss =  recon_in_loss +\
                     recon_out_loss +\
                     pred_coeff_loss +\
