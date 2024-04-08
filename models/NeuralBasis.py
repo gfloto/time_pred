@@ -169,6 +169,56 @@ class ParallelEigenFunction(nn.Module):
 
         return x
 
+# from https://openreview.net/forum?id=cGDAkQo1C0p
+class RevIN(nn.Module):
+    def __init__(self, num_features: int, eps=1e-5, affine=True):
+        """
+        :param num_features: the number of features or channels
+        :param eps: a value added for numerical stability
+        :param affine: if True, RevIN has learnable affine parameters
+        """
+        super(RevIN, self).__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.affine = affine
+        if self.affine:
+            self._init_params()
+
+    def forward(self, x, mode:str):
+        if mode == 'norm':
+            self._get_statistics(x)
+            x = self._normalize(x)
+        elif mode == 'denorm':
+            x = self._denormalize(x)
+        else: raise NotImplementedError
+        return x
+
+    def _init_params(self):
+        # initialize RevIN params: (C,)
+        self.affine_weight = nn.Parameter(torch.ones(self.num_features))
+        self.affine_bias = nn.Parameter(torch.zeros(self.num_features))
+
+    def _get_statistics(self, x):
+        dim2reduce = tuple(range(1, x.ndim-1))
+        self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
+        self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
+
+    def _normalize(self, x):
+        x = x - self.mean
+        x = x / self.stdev
+        if self.affine:
+            x = x * self.affine_weight
+            x = x + self.affine_bias
+        return x
+
+    def _denormalize(self, x):
+        if self.affine:
+            x = x - self.affine_bias
+            x = x / (self.affine_weight + self.eps*self.eps)
+        x = x * self.stdev
+        x = x + self.mean
+        return x
+
 # make domain for eigen-functions
 def make_domain(window_size):
     return torch.linspace(0, 1, window_size)[..., None]
@@ -227,6 +277,9 @@ class Model(nn.Module):
         self.is_train = True
         self.eigenfunc_in = None
         self.eigenfunc_out = None
+
+        # revin for normalization
+        self.revin = RevIN(self.channels, affine=True)
 
         # make time operator
         dim_in = (self.num_basis_in + 1) * self.channels + 4
@@ -292,17 +345,18 @@ class Model(nn.Module):
         y = batch_y
         label = x_mark_enc[:, -1]
 
+        x_in = self.revin(x, 'norm')
+
         if y is not None:
+            y_in = self.revin(y, 'norm')
+
             # get coeffs, perform reconstruction
             recon_in, coeffs_in, eigenfunc_in, ortho_in = neural_recon(
-                x, self.eigenmodel_in, self.seq_len, self.num_basis_in, self.channels
+                x_in, self.eigenmodel_in, self.seq_len, self.num_basis_in, self.channels
             )
 
-            # predict res
-            y -= x 
-
             recon_out, coeffs_out, eigenfunc_out, ortho_out = neural_recon(
-                y, self.eigenmodel_out, self.pred_len, self.num_basis_out, self.channels
+                y_in, self.eigenmodel_out, self.pred_len, self.num_basis_out, self.channels
             )
 
             ortho_loss = ortho_in + ortho_out
@@ -316,7 +370,7 @@ class Model(nn.Module):
             eigenfunc_in = self.eigenfunc_in
             eigenfunc_out = self.eigenfunc_out
 
-            coeffs_in = torch.einsum('b t c, t e c -> b e c', x, eigenfunc_in)
+            coeffs_in = torch.einsum('b t c, t e c -> b e c', x_in, eigenfunc_in)
             recon_in = torch.einsum('b e c, t e c -> b t c', coeffs_in, eigenfunc_in)
 
         # time operator 
@@ -326,21 +380,22 @@ class Model(nn.Module):
         coeff_pred_flat = self.time_op(coeff_flat_in)
 
         pred_coeff = rearrange(coeff_pred_flat, 'b (e c) -> b e c', e=self.num_basis_out+1, c=self.channels)
-        pred_recon = torch.einsum('b e c, t e c -> b t c', pred_coeff, eigenfunc_out)
-        pred = pred_recon
+        pred = torch.einsum('b e c, t e c -> b t c', pred_coeff, eigenfunc_out)
 
         # losses
         if y is None:
-            return pred + x 
+            pred = self.revin(pred, 'denorm')
+            return pred
         else:
-            recon_in_loss = (x - recon_in).abs().mean()
-            recon_out_loss = (y - recon_out).abs().mean()
+            recon_in_loss = (x_in - recon_in).abs().mean()
+            recon_out_loss = (y_in - recon_out).abs().mean()
             pred_coeff_loss = (coeffs_out - pred_coeff).abs().mean()
-            pred_recon_loss = (y - pred).abs().mean()
+            pred_recon_loss = (y_in - pred).abs().mean()
             loss =  recon_in_loss +\
                     recon_out_loss +\
                     pred_coeff_loss +\
                     pred_recon_loss +\
                     ortho_loss
 
-            return pred + x, loss
+            pred = self.revin(pred, 'denorm')
+            return pred, loss
