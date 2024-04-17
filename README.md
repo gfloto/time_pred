@@ -44,7 +44,7 @@ On an in-house univariate dataset, the model was able to outperform all benchmar
 While we can't talk much about the dataset, here is a plot of the 16 functions that make up the learned input basis (sampled at the data frequency):
 
 <p align="center">
-	<img src="assets/eigenplot.png" width=500>
+	<img src="assets/eigenplot.png" width=400>
 </p>
 
 Overall this worked quite well! Especially considering that the time operator we learn is linear. Next, we try the method on a more standard benchmark...
