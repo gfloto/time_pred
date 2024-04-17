@@ -50,6 +50,6 @@ While we can't talk much about the dataset, here is a plot of the 16 functions t
 Overall this worked quite well! Especially considering that the time operator we learn is linear. Next, we try the method on a more standard benchmark...
 
 ## Further Results
-The [thuml](https://github.com/thuml/Time-Series-Library) repo is a great resource for time series forecasting benchmarks. It includes up to date models including methods from ICLR 2024. On the Long-term forecasting look-back-96 look-forward-96 task for the Ettm1 dataset (the first and only one tested so far), our proposed method get 3rd overall place out of more than 2 dozen models.
+The [thuml](https://github.com/thuml/Time-Series-Library) repo is a great resource for time series forecasting benchmarks. It includes up to date models including methods from ICLR 2024. On the Long-term forecasting look-back-96 look-forward-96 task for the Ettm1 dataset (the first and only one tested so far), our proposed method get 3rd overall place out of more than 2 dozen models. It should be noted that these results are **very** preliminary and we expect to improve upon the current results.
 
 On this test, we included [reversible instance normalization](https://openreview.net/forum?id=cGDAkQo1C0p) to slightly boost the performance of the model.
